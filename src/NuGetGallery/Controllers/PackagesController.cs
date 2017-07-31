@@ -423,14 +423,17 @@ namespace NuGetGallery
 
             if (package.HasReadMe)
             {
-                using (var readmeStream = await _packageFileService.DownloadReadmeFileAsync(package, Constants.HtmlFileExtension))
+                using (var readMeMdStream = await _packageFileService.DownloadReadmeFileAsync(package))
                 {
-                    if (readmeStream != null)
+                    if (readMeMdStream != null)
                     {
-                        // Reads the README file and push to the view
-                        using (var reader = new StreamReader(readmeStream, Encoding.UTF8))
+                        using (var readMeHTMLStream = ReadMeHelper.GetReadMeHtmlStream(readMeMdStream))
                         {
-                            model.ReadMeHtml = await reader.ReadToEndAsync();
+                            // Reads the README file and push to the view
+                            using (var reader = new StreamReader(readMeHTMLStream, Encoding.UTF8))
+                            {
+                                model.ReadMeHtml = await reader.ReadToEndAsync();
+                            }
                         }
                     }
                     else if (User.IsInRole(Constants.AdminRoleName) || package.IsOwner(User))
@@ -1046,7 +1049,6 @@ namespace NuGetGallery
         [RequiresAccountConfirmation("edit a package")]
         public virtual async Task<JsonResult> Edit(string id, string version, VerifyPackageRequest formData, string returnUrl)
         {
-
             var package = _packageService.FindPackageByIdAndVersion(id, version);
             if (package == null)
             {
@@ -1070,7 +1072,35 @@ namespace NuGetGallery
             {
                 try
                 {
-                    formData.Edit.ReadMeState = PackageEditReadMeState.Unchanged;
+                    // Checks to see if a ReadMe file has been added and uploads ReadMe
+                    // Add the edit request to a queue where it will be processed in the background.
+                    var readMeChanged = PackageEditReadMeState.Unchanged;
+
+                    if (ReadMeHelper.HasReadMe(formData.ReadMe))
+                    {
+                        readMeChanged = PackageEditReadMeState.Changed;
+                        try
+                        {
+                            using (var readMeInputStream = ReadMeHelper.GetReadMeMarkdownStream(formData.ReadMe).AsSeekableStream())
+                            {
+                                await _packageFileService.SaveReadMeFileAsync(package, readMeInputStream);
+                            }
+                        }
+                        catch (Exception ex) when (
+                            ex is InvalidOperationException
+                            || ex is ArgumentException
+                            || ex is ArgumentNullException
+                        )
+                        {
+                            TempData["Message"] = ex.Message;
+
+                            Response.StatusCode = 400;
+                            return Json(new string[] { ex.GetUserSafeMessage() });
+                        }
+                    }
+
+                    formData.ReadMe.ReadMeState = readMeChanged;
+
                     _editPackageService.StartEditPackageRequest(package, formData.Edit, user);
                     await _entitiesContext.SaveChangesAsync();
 
@@ -1360,15 +1390,7 @@ namespace NuGetGallery
                         {
                             using (var readMeInputStream = ReadMeHelper.GetReadMeMarkdownStream(formData.ReadMe).AsSeekableStream())
                             {
-                                // Saves ReadMe in HTML
-                                using (var readMeHTMLStream = ReadMeHelper.GetReadMeHtmlStream(readMeInputStream))
-                                {
-                                    await _packageFileService.SaveReadMeFileAsync(package, readMeHTMLStream, Constants.HtmlFileExtension);
-                                }
-                                readMeInputStream.Position = 0;
-
-                                // Saves ReadMe in markdown
-                                await _packageFileService.SaveReadMeFileAsync(package, readMeInputStream, Constants.MarkdownFileExtension);
+                                await _packageFileService.SaveReadMeFileAsync(package, readMeInputStream);
                             }
                         }
                         catch (Exception ex) when (
